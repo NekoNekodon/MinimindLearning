@@ -1,6 +1,6 @@
-# MinimindLearning
+
+# Minimind Learning
 A personal practice on Minimind project
-# MinimindLearning
 基於 MiniMind 輕量級大模型的本地訓練、微調與學習項目
 
 > 原項目倉庫地址：[https://github.com/NekoNekodon/MinimindLearning/tree/main](https://github.com/jingyaogong/minimind)
