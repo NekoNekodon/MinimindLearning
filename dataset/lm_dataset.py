@@ -1,0 +1,139 @@
+import json
+
+from torch.utils.data import Dataset
+import torch
+import os
+import random
+from datasets import load_dataset
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+def pre_processing_chat(conversations, add_system_ratio=0.2):
+    # tool use 数据完整保留不做处理
+    if any(conv.get('tools') for conv in conversations): return conversations
+
+    SYSTEM_PROMPTS = [
+        "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
+        "你是minimind，一个小巧但有用的语言模型。",
+        "你是一个专业的AI助手，请提供有价值的回答。",
+        "你是minimind，请尽力帮助用户解决问题。",
+        "你是一个可靠的AI，请给出准确的回答。",
+        "You are a helpful AI assistant.",
+        "You are minimind, a lightweight intelligent assistant.",
+        "You are a friendly chatbot. Please answer the user's questions carefully.",
+        "You are a knowledgeable AI. Try your best to provide accurate information.",
+        "You are minimind, a small but useful language model."
+    ]
+    # 概率性添加system
+    if conversations[0].get('role') != 'system':
+        if random.random() < add_system_ratio:
+            return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
+    return conversations
+
+def post_processing_chat(prompt_content, empty_think_ratio=0.2):
+    # 以80%概率移除空思考标签
+    if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
+        prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
+    return prompt_content
+
+
+class SFTDataset(Dataset):
+    def __init__(self, jasonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = load_dataset("json", data_files=jasonl_path,split="train")
+        self.bos_id =tokenizer(f"{tokenizer.bos_token}assistant\n",add_special_tokens=False).input_ids
+        self.eos_id =tokenizer(f"{tokenizer.eos_token}\n",add_special_tokens=False).input_ids
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def create_chat_prompt(self, conversations):
+        messages = conversations.copy()
+        tools =(
+            conversations[0]['function']
+            if(
+                conversations
+                and conversations[0].get('role') == 'system'
+                and conversations[0].get('function')
+            ) else None
+        )
+        return self.tokenizer.apply_chat_template(
+            conversation=messages,
+            tokenize=False,
+            tools=tools,
+            add_special_tokens=False,
+        )
+    
+    def gengrate_labels(self,input_ids):
+        #let all inputid = -100 (default ignore value)
+        labels= [-100] * len(input_ids)
+        i=0
+        while i<len(input_ids):
+            if input_ids[i:i+len(self.bos_id)] == self.bos_id:
+                #find starting point
+                start=i+len(self.bos_id)
+                end=start
+
+                while end<len(input_ids):
+                    if input_ids[end:end+end+len(self.eos_id)] == self.eos_id:
+                        break
+                    end+=1
+
+                for j in range(start,min(end+len(self.eos_id),len(input_ids))):
+                    labels[j] = input_ids[j]
+                i=end+len(self.eos_id) if end<len(input_ids) else len(input_ids) #如果end超出范围，跳过EOS token
+        return labels
+    
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        #是否随机插入system prompt
+        conversations = pre_processing_chat(sample["conversations"])
+        #用chat_template 把对话转为文本
+        prompt = self.create_chat_prompt(conversations)
+        #清空think块
+        prompt = post_processing_chat(prompt)
+        #toknize 截断 补足pad
+        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        input_ids += [self.tokenizer.pad_token_id]*(self.max_length-len(input_ids))
+        #生成labels 只让assistant  参与loss计算
+        labels = self.gengrate_labels(input_ids)
+
+        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+    
+class PretrainDataset(Dataset):
+    def __init__(self, data_path, tokenizer, max_length=512):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.tokenizer = tokenizer
+        self.samples = load_dataset("json", data_files=data_path,split="train")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        #tokenizer 把文本转化为input_id
+        tokens = self.tokenizer(
+            str(sample["text"]), #假设json文件中每个样本都有"text"字段
+            add_special_tokens=False,
+            max_length=self.max_length - 2, #留位置给BOS EOS
+            truncation=True, #长度超过max自动剪切
+            ).input_ids
+    
+        #需要加上EOS BOS PAD填充
+        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        #需要写labels防止PAD参与loss计算
+        labels = input_ids.clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100 #PAD token 不参与loss计算
+
+        #需要写attention_mask，用于mask掉PAD token
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+
+        #需要输出input_ids, labels, attention_mask
+        return input_ids,  attention_mask, labels
